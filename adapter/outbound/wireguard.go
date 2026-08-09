@@ -346,9 +346,9 @@ func NewWireGuard(option WireGuardOption) (*WireGuard, error) {
 		if err != nil {
 			return nil, err
 		}
-		for i := range nss {
-			nss[i].ProxyAdapter = outbound
-		}
+		// 注意：不设置 ProxyAdapter（DoH 直连，不走 SG-Node 隧道）。
+		// 若 DoH 走隧道，隧道未就绪时 DoH 解析也会失败，形成死锁，
+		// 导致所有域名解析超时、连接建立缓慢。
 		outbound.resolver = dns.NewResolver(dns.Config{
 			Main: nss,
 			IPv6: has6,
