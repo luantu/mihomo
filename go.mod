@@ -153,4 +153,4 @@ require (
 // for https://github.com/golang/protobuf/issues/1704
 replace google.golang.org/protobuf => github.com/metacubex/protobuf-go v0.0.0-20260306035419-7ceee0674686
 
-replace github.com/metacubex/wireguard-go => /Users/luantu/work/wg-fork/wireguard-go
+replace github.com/metacubex/wireguard-go => /Users/luantu/corplink-sg/sg-proxy/source/wg-fork/wireguard-go
