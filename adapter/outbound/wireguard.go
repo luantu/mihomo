@@ -80,6 +80,10 @@ type WireGuardOption struct {
 	TCP                 bool   `proxy:"tcp,omitempty"`
 	PersistentKeepalive int    `proxy:"persistent-keepalive,omitempty"`
 
+	// Corplink 认证（可选）：启用后启动时调用 corplink /vpn/conn API
+	// 获取当前会话分配的隧道 IP 与服务器公钥，自动覆盖 ip/public-key。
+	Corplink CorplinkOption `proxy:"corplink,omitempty"`
+
 	AmneziaWGOption *AmneziaWGOption `proxy:"amnezia-wg-option,omitempty"`
 
 	Peers []WireGuardPeerOption `proxy:"peers,omitempty"`
@@ -214,6 +218,11 @@ func NewWireGuard(option WireGuardOption) (*WireGuard, error) {
 		// TCP transport：直接连服务器（不依赖 sing dialer），兼容 corplink-rs 的 TCP 封装
 		target := outbound.connectAddr
 		log.Infoln("[WG](%s) using TCP transport, target=%s", option.Name, target)
+		if option.Corplink.APIServer != "" {
+			log.Infoln("[WG](%s) corplink auth enabled: api=%s code=%s cookie=%s", option.Name, option.Corplink.APIServer, option.Corplink.Code, option.Corplink.CookieFile)
+		} else {
+			log.Infoln("[WG](%s) corplink auth NOT enabled", option.Name)
+		}
 		outbound.bind = newTCPWireGuardBind(context.Background(), func(ctx context.Context) (net.Conn, error) {
 			d := net.Dialer{}
 			nc, err := d.DialContext(ctx, "tcp", target.String())
@@ -281,6 +290,19 @@ func NewWireGuard(option WireGuardOption) (*WireGuard, error) {
 				return nil, E.Cause(err, "decode pre shared key")
 			}
 			option.PreSharedKey = hex.EncodeToString(bytes)
+		}
+	}
+
+	// corplink 认证：在创建 wireguard 栈设备前调用 corplink /vpn/conn API
+	// 获取当前会话分配的隧道 IP 与服务器公钥，覆盖节点配置。
+	// 此时 option.PublicKey 已统一为 hex 格式，fetch 返回的 hex 直接可用。
+	if option.Corplink.APIServer != "" {
+		if err := refreshCorplinkOption(&option); err != nil {
+			return nil, err
+		}
+		outbound.localPrefixes, err = option.Prefixes()
+		if err != nil {
+			return nil, err
 		}
 	}
 	outbound.option = option
@@ -424,6 +446,31 @@ func (w *WireGuard) updateServerAddr(ctx context.Context) {
 			w.serverAddrTime.Store(time.Now())
 		}
 	}
+}
+
+// refreshCorplinkOption 调用 corplink /vpn/conn API 获取当前会话分配的隧道 IP
+// 与服务器公钥，并覆盖节点配置（ip / public-key / mtu）。在创建 wireguard
+// 栈设备前调用，保证 local prefixes 与 MTU 使用服务器下发的正确值。
+func refreshCorplinkOption(option *WireGuardOption) error {
+	opt := option.Corplink
+	if opt.PublicKey == "" {
+		opt.PublicKey = option.PublicKey
+	}
+	info, err := fetchCorplinkWgInfo(opt)
+	if err != nil {
+		return E.Cause(err, "corplink fetch peer info")
+	}
+	if info.IP != "" {
+		option.Ip = info.IP
+	}
+	if info.ServerPubKeyHex != "" {
+		option.PublicKey = info.ServerPubKeyHex
+	}
+	if info.MTU != 0 {
+		option.MTU = info.MTU
+	}
+	log.Infoln("[WG](%s) corplink refreshed: ip=%s public_key=%s mtu=%d", option.Name, option.Ip, option.PublicKey, option.MTU)
+	return nil
 }
 
 func (w *WireGuard) genIpcConf(ctx context.Context, updateOnly bool) (string, error) {
