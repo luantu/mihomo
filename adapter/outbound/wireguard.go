@@ -219,7 +219,7 @@ func NewWireGuard(option WireGuardOption) (*WireGuard, error) {
 		target := outbound.connectAddr
 		log.Infoln("[WG](%s) using TCP transport, target=%s", option.Name, target)
 		if option.Corplink.APIServer != "" {
-			log.Infoln("[WG](%s) corplink auth enabled: api=%s code=%s cookie=%s", option.Name, option.Corplink.APIServer, option.Corplink.Code, option.Corplink.CookieFile)
+			log.Infoln("[WG](%s) corplink auth enabled: api=%s cookie=%s", option.Name, option.Corplink.APIServer, option.Corplink.CookieFile)
 		} else {
 			log.Infoln("[WG](%s) corplink auth NOT enabled", option.Name)
 		}
@@ -372,7 +372,6 @@ func (w *WireGuard) resolve(ctx context.Context, address M.Socksaddr) (netip.Add
 }
 
 func (w *WireGuard) init(ctx context.Context) error {
-	log.Infoln("[WG](%s) init called", w.option.Name)
 	err := w.init0(ctx)
 	if err != nil {
 		log.Warnln("[WG](%s) init0 error: %v", w.option.Name, err)
@@ -383,7 +382,6 @@ func (w *WireGuard) init(ctx context.Context) error {
 }
 
 func (w *WireGuard) init0(ctx context.Context) error {
-	log.Infoln("[WG](%s) init0 begin", w.option.Name)
 	if w.initOk.Load() {
 		return nil
 	}
@@ -396,6 +394,7 @@ func (w *WireGuard) init0(ctx context.Context) error {
 	if w.initErr != nil {
 		return w.initErr
 	}
+	log.Debugln("[WG](%s) initializing", w.option.Name)
 
 	w.bind.ResetReservedForEndpoint()
 	w.serverAddrMap = make(map[M.Socksaddr]netip.AddrPort)

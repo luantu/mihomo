@@ -38,15 +38,21 @@ type tcpRecvData struct {
 	endpoint wgconn.Endpoint
 }
 
+type tcpConnState struct {
+	conn    *net.TCPConn
+	writeMu sync.Mutex
+}
+
 type tcpWireGuardBind struct {
 	ctx    context.Context
 	dialer func(context.Context) (net.Conn, error)
 
-	tcpConnMap sync.Map // string -> *net.TCPConn
+	tcpConnMap sync.Map // string -> *tcpConnState
 	listener   net.Listener
 	recvChan   chan *tcpRecvData
 	closeChan  chan struct{}
 	closed     atomic.Bool
+	closeOnce  sync.Once
 
 	mu sync.Mutex
 }
@@ -63,6 +69,7 @@ func newTCPWireGuardBind(ctx context.Context, dialFn func(context.Context) (net.
 
 func (t *tcpWireGuardBind) Open(port uint16) ([]wgconn.ReceiveFunc, uint16, error) {
 	t.closed.Store(false)
+	t.closeOnce = sync.Once{}
 	t.closeChan = make(chan struct{})
 
 	// 与 corplink-rs 一致：同时监听端口，接收服务器回调连接（双向隧道）
@@ -81,57 +88,82 @@ func (t *tcpWireGuardBind) accept() {
 		if err != nil {
 			return
 		}
-		tcpConn := conn.(*net.TCPConn)
+		tcpConn, ok := conn.(*net.TCPConn)
+		if !ok {
+			_ = conn.Close()
+			continue
+		}
 		tcpConn.SetNoDelay(true)
 		addrPort := tcpConn.RemoteAddr().(*net.TCPAddr).AddrPort()
 		endpoint := &wgconn.StdNetEndpoint{AddrPort: addrPort}
-		t.tcpConnMap.Store(endpoint.DstToString(), tcpConn)
-		t.handleConn(tcpConn, endpoint)
+		state := &tcpConnState{conn: tcpConn}
+		t.tcpConnMap.Store(endpoint.DstToString(), state)
+		t.handleConn(state, endpoint, t.closeChan)
 	}
 }
 
-func (t *tcpWireGuardBind) handleConn(conn *net.TCPConn, endpoint wgconn.Endpoint) {
-	go func() {
-		defer conn.Close()
-		defer t.tcpConnMap.Delete(endpoint.DstToString())
+func readTCPFrame(r io.Reader) ([]byte, error) {
+	var lenBuf [4]byte
+	if _, err := io.ReadFull(r, lenBuf[:]); err != nil {
+		return nil, err
+	}
+	frameLen := tcpReqLen(lenBuf)
+	size := frameLen.Len()
+	if size <= 0 || size > tcpMaxSegmentSize {
+		return nil, fmt.Errorf("invalid TCP WireGuard frame length %d", size)
+	}
+	buff := make([]byte, size)
+	if _, err := io.ReadFull(r, buff); err != nil {
+		return nil, err
+	}
+	return buff, nil
+}
 
-		var lenBuf [4]byte
+func writeFull(w io.Writer, buffer []byte) error {
+	for len(buffer) > 0 {
+		n, err := w.Write(buffer)
+		if err != nil {
+			return err
+		}
+		if n <= 0 || n > len(buffer) {
+			return io.ErrShortWrite
+		}
+		buffer = buffer[n:]
+	}
+	return nil
+}
+
+func (t *tcpWireGuardBind) handleConn(state *tcpConnState, endpoint wgconn.Endpoint, closeChan <-chan struct{}) {
+	go func() {
+		defer state.conn.Close()
+		defer t.tcpConnMap.CompareAndDelete(endpoint.DstToString(), state)
+
 		for {
-			_, err := io.ReadFull(conn, lenBuf[:])
+			buff, err := readTCPFrame(state.conn)
 			if err != nil {
+				if !t.closed.Load() && err != io.EOF {
+					log.Debugln("[WG-TCP] receive from %s stopped: %v", endpoint.DstToString(), err)
+				}
 				return
-			}
-			l := tcpReqLen(lenBuf)
-			size := l.Len()
-			if size > tcpMaxSegmentSize || size < 0 {
-				continue
-			}
-			buff := make([]byte, size)
-			n, err := io.ReadFull(conn, buff)
-			if err != nil {
-				return
-			}
-			if n != size {
-				continue
 			}
 			select {
-			case <-t.closeChan:
+			case <-closeChan:
 				return
-			case t.recvChan <- &tcpRecvData{buff: buff, size: size, endpoint: endpoint}:
+			case t.recvChan <- &tcpRecvData{buff: buff, size: len(buff), endpoint: endpoint}:
 			}
 		}
 	}()
 }
 
-func (t *tcpWireGuardBind) getConn(endpoint wgconn.Endpoint) (*net.TCPConn, error) {
+func (t *tcpWireGuardBind) getConn(endpoint wgconn.Endpoint) (*tcpConnState, error) {
 	if v, ok := t.tcpConnMap.Load(endpoint.DstToString()); ok {
-		return v.(*net.TCPConn), nil
+		return v.(*tcpConnState), nil
 	}
 
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	if v, ok := t.tcpConnMap.Load(endpoint.DstToString()); ok {
-		return v.(*net.TCPConn), nil
+		return v.(*tcpConnState), nil
 	}
 
 	log.Infoln("[WG-TCP] dialing %s", endpoint.DstToString())
@@ -140,11 +172,16 @@ func (t *tcpWireGuardBind) getConn(endpoint wgconn.Endpoint) (*net.TCPConn, erro
 		log.Warnln("[WG-TCP] dial %s failed: %v", endpoint.DstToString(), err)
 		return nil, err
 	}
-	tcpConn := raw.(*net.TCPConn)
+	tcpConn, ok := raw.(*net.TCPConn)
+	if !ok {
+		_ = raw.Close()
+		return nil, fmt.Errorf("TCP WireGuard dialer returned %T, want *net.TCPConn", raw)
+	}
 	tcpConn.SetNoDelay(true)
-	t.handleConn(tcpConn, endpoint)
-	t.tcpConnMap.Store(endpoint.DstToString(), tcpConn)
-	return tcpConn, nil
+	state := &tcpConnState{conn: tcpConn}
+	t.handleConn(state, endpoint, t.closeChan)
+	t.tcpConnMap.Store(endpoint.DstToString(), state)
+	return state, nil
 }
 
 func (t *tcpWireGuardBind) Send(bufs [][]byte, endpoint wgconn.Endpoint) error {
@@ -153,10 +190,9 @@ func (t *tcpWireGuardBind) Send(bufs [][]byte, endpoint wgconn.Endpoint) error {
 		if len(b) >= 4 {
 			mt = uint32(b[0]) | uint32(b[1])<<8 | uint32(b[2])<<16 | uint32(b[3])<<24
 		}
-		log.Infoln("[WG-TCP] Send len=%d type=%d to %s", len(b), mt, endpoint.DstToString())
+		log.Debugln("[WG-TCP] send len=%d type=%d to %s", len(b), mt, endpoint.DstToString())
 	}
-	log.Infoln("[WG-TCP] Send %d bufs to %s", len(bufs), endpoint.DstToString())
-	c, err := t.getConn(endpoint)
+	state, err := t.getConn(endpoint)
 	if err != nil {
 		return err
 	}
@@ -171,7 +207,13 @@ func (t *tcpWireGuardBind) Send(bufs [][]byte, endpoint wgconn.Endpoint) error {
 		buffer = append(buffer, l[:]...)
 		buffer = append(buffer, b...)
 	}
-	_, err = c.Write(buffer)
+	state.writeMu.Lock()
+	err = writeFull(state.conn, buffer)
+	state.writeMu.Unlock()
+	if err != nil {
+		t.tcpConnMap.CompareAndDelete(endpoint.DstToString(), state)
+		_ = state.conn.Close()
+	}
 	return err
 }
 
@@ -191,16 +233,21 @@ func (t *tcpWireGuardBind) receive(bufs [][]byte, sizes []int, eps []wgconn.Endp
 }
 
 func (t *tcpWireGuardBind) Close() error {
-	t.closed.Store(true)
-	if t.closeChan != nil {
-		close(t.closeChan)
-	}
-	t.tcpConnMap.Range(func(k, v interface{}) bool {
-		if c, ok := v.(*net.TCPConn); ok {
-			_ = c.Close()
+	t.closeOnce.Do(func() {
+		t.closed.Store(true)
+		if t.closeChan != nil {
+			close(t.closeChan)
 		}
-		t.tcpConnMap.Delete(k)
-		return true
+		if t.listener != nil {
+			_ = t.listener.Close()
+		}
+		t.tcpConnMap.Range(func(k, v interface{}) bool {
+			if state, ok := v.(*tcpConnState); ok {
+				_ = state.conn.Close()
+			}
+			t.tcpConnMap.Delete(k)
+			return true
+		})
 	})
 	return nil
 }
@@ -218,7 +265,7 @@ func (t *tcpWireGuardBind) ParseEndpoint(s string) (wgconn.Endpoint, error) {
 }
 
 // 兼容 ClientBind 的附加方法（TCP 模式无实际语义，空实现即可）
-func (t *tcpWireGuardBind) SetConnectAddr(addrPort netip.AddrPort) {}
+func (t *tcpWireGuardBind) SetConnectAddr(addrPort netip.AddrPort)         {}
 func (t *tcpWireGuardBind) SetReservedForEndpoint(netip.AddrPort, [3]byte) {}
-func (t *tcpWireGuardBind) ResetReservedForEndpoint()              {}
-func (t *tcpWireGuardBind) SetParseReserved(bool)                  {}
+func (t *tcpWireGuardBind) ResetReservedForEndpoint()                      {}
+func (t *tcpWireGuardBind) SetParseReserved(bool)                          {}
