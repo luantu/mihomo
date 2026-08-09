@@ -23,6 +23,7 @@ import (
 
 	amnezia "github.com/metacubex/amneziawg-go/device"
 	wireguard "github.com/metacubex/sing-wireguard"
+	wgconn "github.com/metacubex/wireguard-go/conn"
 	"github.com/metacubex/wireguard-go/device"
 
 	"github.com/metacubex/sing/common/debug"
@@ -35,9 +36,19 @@ type wireguardGoDevice interface {
 	IpcSet(uapiConf string) error
 }
 
+// wireGuardBind 抽象 UDP（sing ClientBind）与 TCP（自定义）两种 transport，
+// 统一暴露 wireguard-go conn.Bind 及 ClientBind 的附加方法。
+type wireGuardBind interface {
+	wgconn.Bind
+	SetConnectAddr(netip.AddrPort)
+	SetReservedForEndpoint(netip.AddrPort, [3]byte)
+	ResetReservedForEndpoint()
+	SetParseReserved(bool)
+}
+
 type WireGuard struct {
 	*Base
-	bind      *wireguard.ClientBind
+	bind      wireGuardBind
 	device    wireguardGoDevice
 	tunDevice wireguard.Device
 	resolver  resolver.Resolver
@@ -64,6 +75,9 @@ type WireGuardOption struct {
 	Workers             int    `proxy:"workers,omitempty"`
 	MTU                 int    `proxy:"mtu,omitempty"`
 	UDP                 bool   `proxy:"udp,omitempty"`
+	// TCP 使 wireguard 走 TCP transport（兼容 corplink-rs 的 TCP 封装），
+	// 用于公司内部仅开放 TCP 的节点。默认 false（标准 UDP）。
+	TCP                 bool   `proxy:"tcp,omitempty"`
 	PersistentKeepalive int    `proxy:"persistent-keepalive,omitempty"`
 
 	AmneziaWGOption *AmneziaWGOption `proxy:"amnezia-wg-option,omitempty"`
@@ -196,7 +210,21 @@ func NewWireGuard(option WireGuardOption) (*WireGuard, error) {
 			outbound.connectAddr = option.Addr()
 		}
 	}
-	outbound.bind = wireguard.NewClientBind(context.Background(), wgSingErrorHandler{outbound.Name()}, singDialer, isConnect, outbound.connectAddr.AddrPort(), reserved)
+	if option.TCP {
+		// TCP transport：直接连服务器（不依赖 sing dialer），兼容 corplink-rs 的 TCP 封装
+		target := outbound.connectAddr
+		log.Infoln("[WG](%s) using TCP transport, target=%s", option.Name, target)
+		outbound.bind = newTCPWireGuardBind(context.Background(), func(ctx context.Context) (net.Conn, error) {
+			d := net.Dialer{}
+			nc, err := d.DialContext(ctx, "tcp", target.String())
+			if err != nil {
+				return nil, err
+			}
+			return nc, nil
+		})
+	} else {
+		outbound.bind = wireguard.NewClientBind(context.Background(), wgSingErrorHandler{outbound.Name()}, singDialer, isConnect, outbound.connectAddr.AddrPort(), reserved)
+	}
 
 	var err error
 	outbound.localPrefixes, err = option.Prefixes()
@@ -322,8 +350,10 @@ func (w *WireGuard) resolve(ctx context.Context, address M.Socksaddr) (netip.Add
 }
 
 func (w *WireGuard) init(ctx context.Context) error {
+	log.Infoln("[WG](%s) init called", w.option.Name)
 	err := w.init0(ctx)
 	if err != nil {
+		log.Warnln("[WG](%s) init0 error: %v", w.option.Name, err)
 		return err
 	}
 	w.updateServerAddr(ctx)
@@ -331,6 +361,7 @@ func (w *WireGuard) init(ctx context.Context) error {
 }
 
 func (w *WireGuard) init0(ctx context.Context) error {
+	log.Infoln("[WG](%s) init0 begin", w.option.Name)
 	if w.initOk.Load() {
 		return nil
 	}
@@ -358,6 +389,7 @@ func (w *WireGuard) init0(ctx context.Context) error {
 	}
 	err = w.device.IpcSet(ipcConf)
 	if err != nil {
+		log.Warnln("[WG](%s) IpcSet error: %v", w.option.Name, err)
 		w.initErr = E.Cause(err, "setup wireguard")
 		return w.initErr
 	}
@@ -365,9 +397,11 @@ func (w *WireGuard) init0(ctx context.Context) error {
 
 	err = w.tunDevice.Start()
 	if err != nil {
+		log.Warnln("[WG](%s) tunDevice.Start error: %v", w.option.Name, err)
 		w.initErr = err
 		return w.initErr
 	}
+	log.Infoln("[WG](%s) tunDevice started", w.option.Name)
 
 	w.initOk.Store(true)
 	return nil
