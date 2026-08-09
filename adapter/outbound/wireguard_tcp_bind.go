@@ -5,6 +5,7 @@ package outbound
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -18,6 +19,10 @@ import (
 )
 
 const tcpMaxSegmentSize = 65535
+
+// errBadFrameLength 表示解析到异常的 TCP WireGuard 帧长度，
+// 读循环应跳过该帧继续处理，而不是终止整条隧道连接。
+var errBadFrameLength = errors.New("invalid TCP WireGuard frame length")
 
 type tcpReqLen [4]byte
 
@@ -110,7 +115,9 @@ func readTCPFrame(r io.Reader) ([]byte, error) {
 	frameLen := tcpReqLen(lenBuf)
 	size := frameLen.Len()
 	if size <= 0 || size > tcpMaxSegmentSize {
-		return nil, fmt.Errorf("invalid TCP WireGuard frame length %d", size)
+		// 与 corplink-rs 一致：坏帧跳过，不终止读循环，
+		// 避免因一次错位解析导致整条隧道反复重建。
+		return nil, errBadFrameLength
 	}
 	buff := make([]byte, size)
 	if _, err := io.ReadFull(r, buff); err != nil {
@@ -141,11 +148,20 @@ func (t *tcpWireGuardBind) handleConn(state *tcpConnState, endpoint wgconn.Endpo
 		for {
 			buff, err := readTCPFrame(state.conn)
 			if err != nil {
+				if errors.Is(err, errBadFrameLength) {
+					log.Debugln("[WG-TCP] skip bad frame from %s", endpoint.DstToString())
+					continue
+				}
 				if !t.closed.Load() && err != io.EOF {
 					log.Debugln("[WG-TCP] receive from %s stopped: %v", endpoint.DstToString(), err)
 				}
 				return
 			}
+			mt := uint32(0)
+			if len(buff) >= 4 {
+				mt = uint32(buff[0]) | uint32(buff[1])<<8 | uint32(buff[2])<<16 | uint32(buff[3])<<24
+			}
+			log.Debugln("[WG-TCP] received frame len=%d type=%d from %s", len(buff), mt, endpoint.DstToString())
 			select {
 			case <-closeChan:
 				return

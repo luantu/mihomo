@@ -346,9 +346,19 @@ func NewWireGuard(option WireGuardOption) (*WireGuard, error) {
 		if err != nil {
 			return nil, err
 		}
-		// 注意：不设置 ProxyAdapter（DoH 直连，不走 SG-Node 隧道）。
-		// 若 DoH 走隧道，隧道未就绪时 DoH 解析也会失败，形成死锁，
-		// 导致所有域名解析超时、连接建立缓慢。
+		// DoH 通道策略：
+		// - 海外 DoH (1.1.1.1/8.8.8.8) 走 SG-Node 隧道：本机直连被墙，但隧道内
+		//   能拿到 chatgpt.com 等域名的真实 IP（国内 DoH 会返回污染 IP）。
+		// - 国内 DoH (223.5.5.5 等) 直连：解析国内域名快，作为兜底避免隧道
+		//   抖动时全部超时。
+		// 通过 server 地址区分：1.1.1.1 / 8.8.8.8 走隧道，其余直连。
+		for i := range nss {
+			addr := nss[i].Addr
+			if strings.Contains(addr, "1.1.1.1") || strings.Contains(addr, "8.8.8.8") ||
+				strings.Contains(addr, "1.0.0.1") {
+				nss[i].ProxyAdapter = outbound
+			}
+		}
 		outbound.resolver = dns.NewResolver(dns.Config{
 			Main: nss,
 			IPv6: has6,
