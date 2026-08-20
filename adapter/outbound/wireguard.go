@@ -69,6 +69,7 @@ type WireGuard struct {
 	// TCP 连接并触发受控重连，解决"连接看似存在但数据面无响应"的静默断链。
 	busyFail        atomic.Int32
 	busyFailResetAt atomic.Int64 // unix nano，距上次失败超过窗口则重置计数
+	corplinkRecoveryAt atomic.Int64 // unix nano，限制故障风暴期间的会话刷新频率
 }
 
 // busyFailThreshold 为业务连续失败触发重建的阈值。
@@ -97,9 +98,25 @@ func isTunnelFailure(err error) bool {
 		strings.Contains(msg, "dns-query") || strings.Contains(msg, "no such host") {
 		return false
 	}
-	// context deadline exceeded 若发生在隧道 dial 阶段（含连接建立），计入；
-	// 但纯 DNS 超时已在上方排除。其余网络错误视为隧道失败。
-	return true
+	// Do not classify every dial timeout as a tunnel failure. A target site can
+	// be slow/unreachable while the shared WireGuard transport is healthy;
+	// invalidating the transport after three unrelated target failures creates
+	// the observed self-inflicted reconnect storm. Only explicit transport
+	// failure markers are allowed to tear down the shared TCP-WireGuard link.
+	for _, marker := range []string{
+		"tunnel unavailable",
+		"tunnel not ready",
+		"handshake timeout",
+		"use of closed network connection",
+		"broken pipe",
+		"connection reset by peer",
+		"connection refused",
+	} {
+		if strings.Contains(msg, marker) {
+			return true
+		}
+	}
+	return false
 }
 
 // waitTunnelReady 等待当前 TCP 连接完成 WireGuard 握手（隧道 ready）。
@@ -174,8 +191,51 @@ func (w *WireGuard) invalidateTunnelForBusyFailure() {
 			log.Warnln("[WG](%s) tunnel unhealthy: %d consecutive business failures, invalidating TCP connection %s",
 				w.option.Name, busyFailThreshold, ep)
 			tcpBind.InvalidateEndpoint(ep)
+			// Corplink can rotate the assigned tunnel IP/server peer while the
+			// process is alive. Re-dialing TCP with the old wg_info repeatedly
+			// produces the misleading pattern "TCP connected, handshake timeout".
+			// Refresh the session parameters before the next connection attempt.
+			w.refreshCorplinkAfterTunnelFailure()
 		}
 	}
+}
+
+func (w *WireGuard) refreshCorplinkAfterTunnelFailure() {
+	if w.option.Corplink.APIServer == "" || w.device == nil {
+		return
+	}
+	now := time.Now().UnixNano()
+	last := w.corplinkRecoveryAt.Load()
+	if last != 0 && now-last < int64(15*time.Second) {
+		return
+	}
+	if !w.serverAddrMutex.TryLock() {
+		return
+	}
+	defer w.serverAddrMutex.Unlock()
+	// Re-check after acquiring the lock so concurrent failed dials coalesce
+	// into one refresh instead of repeatedly rewriting the live WG device.
+	now = time.Now().UnixNano()
+	last = w.corplinkRecoveryAt.Load()
+	if last != 0 && now-last < int64(15*time.Second) {
+		return
+	}
+	w.corplinkRecoveryAt.Store(now)
+	if err := refreshCorplinkOption(&w.option); err != nil {
+		log.Warnln("[WG](%s) corplink refresh after tunnel failure failed: %v", w.option.Name, err)
+		return
+	}
+	ipcConf, err := w.genIpcConf(context.Background(), true)
+	if err != nil {
+		log.Warnln("[WG](%s) failed to rebuild peer config after corplink refresh: %v", w.option.Name, err)
+		return
+	}
+	if err := w.device.IpcSet(ipcConf); err != nil {
+		log.Warnln("[WG](%s) failed to apply refreshed peer config: %v", w.option.Name, err)
+		return
+	}
+	w.serverAddrTime.Store(time.Now())
+	log.Infoln("[WG](%s) applied refreshed corplink peer parameters after tunnel failure", w.option.Name)
 }
 
 type WireGuardOption struct {

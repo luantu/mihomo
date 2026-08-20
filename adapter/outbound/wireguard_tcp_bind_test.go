@@ -119,6 +119,15 @@ func TestTunnelFailureDialTimeoutIsShort(t *testing.T) {
 	}
 }
 
+func TestTargetTimeoutDoesNotInvalidateTunnel(t *testing.T) {
+	if isTunnelFailure(context.DeadlineExceeded) {
+		t.Fatal("target timeout must not be treated as a shared tunnel failure")
+	}
+	if !isTunnelFailure(errors.New("tunnel not ready: WireGuard handshake timeout")) {
+		t.Fatal("handshake timeout must invalidate the tunnel")
+	}
+}
+
 type oneByteReader struct{ r io.Reader }
 
 func (r *oneByteReader) Read(p []byte) (int, error) {
