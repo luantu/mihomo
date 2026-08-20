@@ -63,6 +63,111 @@ type WireGuard struct {
 	serverAddrMap   map[M.Socksaddr]netip.AddrPort
 	serverAddrTime  atomic.TypedValue[time.Time]
 	serverAddrMutex sync.Mutex
+
+	// busyFail 记录连续业务失败（业务 dial 超时/隧道内连接失败）次数。
+	// 达到阈值（busyFailThreshold）时视为隧道 unhealthy，主动失效底层
+	// TCP 连接并触发受控重连，解决"连接看似存在但数据面无响应"的静默断链。
+	busyFail        atomic.Int32
+	busyFailResetAt atomic.Int64 // unix nano，距上次失败超过窗口则重置计数
+}
+
+// busyFailThreshold 为业务连续失败触发重建的阈值。
+const busyFailThreshold = 3
+
+// busyFailWindow 为业务失败计数窗口：窗口内累计达到阈值才触发重建，
+// 超过窗口未失败则重置，避免瞬时抖动误触发。
+const busyFailWindow = 30 * time.Second
+
+// wgReadyTimeout 为业务等待隧道握手完成的超时。TCP 建连后 WireGuard
+// 需要完成握手数据面才可用；此超时内业务等待 ready，超时才算失败。
+const wgReadyTimeout = 8 * time.Second
+
+// isTunnelFailure 判断业务错误是否属于"隧道数据面失败"（应触发重建）。
+// DNS 解析失败/超时属于外部解析问题，不应误判为隧道不可用而反复重建。
+func isTunnelFailure(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	// DNS 相关失败不计入隧道健康
+	if strings.Contains(msg, "dns") || strings.Contains(msg, "resolve") ||
+		strings.Contains(msg, "dns-query") || strings.Contains(msg, "no such host") {
+		return false
+	}
+	// context deadline exceeded 若发生在隧道 dial 阶段（含连接建立），计入；
+	// 但纯 DNS 超时已在上方排除。其余网络错误视为隧道失败。
+	return true
+}
+
+// waitTunnelReady 等待当前 TCP 连接完成 WireGuard 握手（隧道 ready）。
+// 返回 true 表示就绪；false 表示超时或连接不存在。仅 TCP 模式使用。
+func (w *WireGuard) waitTunnelReady(ctx context.Context) bool {
+	if !w.option.TCP {
+		return true
+	}
+	tcpBind, ok := w.bind.(interface {
+		IsConnReady(string) bool
+	})
+	if !ok {
+		return true
+	}
+	ep := w.connectAddr.String()
+	// 连接不存在（尚未建立）时直接放行，让 Send 触发建连
+	if !tcpBind.IsConnReady(ep) {
+		// 等待 ready 或超时
+		deadline := time.NewTimer(wgReadyTimeout)
+		defer deadline.Stop()
+		for {
+			if tcpBind.IsConnReady(ep) {
+				return true
+			}
+			select {
+			case <-ctx.Done():
+				return false
+			case <-deadline.C:
+				return false
+			case <-time.After(200 * time.Millisecond):
+			}
+		}
+	}
+	return true
+}
+
+// registerBusyFailure 登记一次业务失败；达到阈值时返回 true（调用方触发重建）。
+func (w *WireGuard) registerBusyFailure() bool {
+	now := time.Now().UnixNano()
+	last := w.busyFailResetAt.Load()
+	if now-last > int64(busyFailWindow) {
+		w.busyFailResetAt.Store(now)
+		w.busyFail.Store(0)
+	}
+	n := w.busyFail.Add(1)
+	if n >= busyFailThreshold {
+		// 达到阈值：重置计数，下次成功后从 0 开始
+		w.busyFail.Store(0)
+		return true
+	}
+	return false
+}
+
+// recordBusySuccess 业务成功时清零失败计数。
+func (w *WireGuard) recordBusySuccess() {
+	w.busyFail.Store(0)
+	w.busyFailResetAt.Store(time.Now().UnixNano())
+}
+
+// invalidateTunnelForBusyFailure 业务连续失败时失效隧道底层连接并触发重建。
+func (w *WireGuard) invalidateTunnelForBusyFailure() {
+	if w.option.TCP {
+		if tcpBind, ok := w.bind.(interface {
+			InvalidateEndpoint(string)
+		}); ok {
+			ep := w.connectAddr.String()
+			log.Warnln("[WG](%s) tunnel unhealthy: %d consecutive business failures, invalidating TCP connection %s",
+				w.option.Name, busyFailThreshold, ep)
+			tcpBind.InvalidateEndpoint(ep)
+		}
+	}
 }
 
 type WireGuardOption struct {
@@ -304,6 +409,8 @@ func NewWireGuard(option WireGuardOption) (*WireGuard, error) {
 		if err != nil {
 			return nil, err
 		}
+		// 启动 cookie 过期检测：即将过期时自动执行 corplink --refresh-cookie
+		corplinkCookieWatchdog(option.Corplink)
 	}
 	outbound.option = option
 
@@ -331,6 +438,29 @@ func NewWireGuard(option WireGuardOption) (*WireGuard, error) {
 		outbound.device = amnezia.NewDevice(outbound.tunDevice, outbound.bind, logger, option.Workers)
 	} else {
 		outbound.device = device.NewDevice(outbound.tunDevice, outbound.bind, logger, option.Workers)
+		// 握手监听：握手永久失败时主动失效底层 TCP 连接（仅 wg-fork device 支持）。
+		// 解决"TCP 连接仍在但 WireGuard 数据面无响应"导致的静默断链。
+		if option.TCP {
+			if wd, ok := outbound.device.(interface {
+				SetHandshakeListener(func(string))
+				SetHandshakeCompleteListener(func(string))
+			}); ok {
+				if tcpBind, ok := outbound.bind.(interface {
+					InvalidateEndpoint(string)
+					MarkConnReady(string)
+				}); ok {
+					wd.SetHandshakeListener(func(endpoint string) {
+						log.Warnln("[WG](%s) handshake failed for %s, invalidating TCP connection", option.Name, endpoint)
+						tcpBind.InvalidateEndpoint(endpoint)
+					})
+					// 握手完成：标记隧道 ready。TCP connected 不等于隧道可用，
+					// 业务只有在握手完成后才允许放行。
+					wd.SetHandshakeCompleteListener(func(endpoint string) {
+						tcpBind.MarkConnReady(endpoint)
+					})
+				}
+			}
+		}
 	}
 
 	var has6 bool
@@ -460,12 +590,22 @@ func (w *WireGuard) updateServerAddr(ctx context.Context) {
 // refreshCorplinkOption 调用 corplink /vpn/conn API 获取当前会话分配的隧道 IP
 // 与服务器公钥，并覆盖节点配置（ip / public-key / mtu）。在创建 wireguard
 // 栈设备前调用，保证 local prefixes 与 MTU 使用服务器下发的正确值。
+// 若首次 fetch 失败且配置了 corplink-refresh-command，会先执行刷新命令
+// 再重试一次，使 cookie 过期场景可以自愈。
 func refreshCorplinkOption(option *WireGuardOption) error {
 	opt := option.Corplink
 	if opt.PublicKey == "" {
 		opt.PublicKey = option.PublicKey
 	}
 	info, err := fetchCorplinkWgInfo(opt)
+	if err != nil && opt.RefreshCommand != "" {
+		log.Warnln("[WG-Corplink] fetch failed (%v), trying refresh command: %s", err, opt.RefreshCommand)
+		if rerr := runCorplinkRefresh(opt.RefreshCommand); rerr != nil {
+			log.Warnln("[WG-Corplink] refresh command failed: %v", rerr)
+			return E.Cause(err, "corplink fetch peer info")
+		}
+		info, err = fetchCorplinkWgInfo(opt)
+	}
 	if err != nil {
 		return E.Cause(err, "corplink fetch peer info")
 	}
@@ -643,6 +783,9 @@ func (w *WireGuard) Close() error {
 func (w *WireGuard) DialContext(ctx context.Context, metadata *C.Metadata) (_ C.Conn, err error) {
 	var conn net.Conn
 	if err = w.init(ctx); err != nil {
+		if isTunnelFailure(err) && w.registerBusyFailure() {
+			w.invalidateTunnelForBusyFailure()
+		}
 		return nil, err
 	}
 	if !metadata.Resolved() || w.resolver != nil {
@@ -658,29 +801,58 @@ func (w *WireGuard) DialContext(ctx context.Context, metadata *C.Metadata) (_ C.
 		conn, err = w.tunDevice.DialContext(ctx, "tcp", M.SocksaddrFrom(metadata.DstIP, metadata.DstPort).Unwrap())
 	}
 	if err != nil {
+		// 业务 dial 失败：区分 DNS 失败与隧道数据面失败。
+		// 仅隧道数据面失败累计到阈值才触发重建，避免 DNS 抖动反复重建。
+		if isTunnelFailure(err) && w.registerBusyFailure() {
+			w.invalidateTunnelForBusyFailure()
+		}
 		return nil, err
 	}
 	if conn == nil {
+		if w.registerBusyFailure() {
+			w.invalidateTunnelForBusyFailure()
+		}
 		return nil, E.New("conn is nil")
 	}
+	// TCP 建连成功，但需等待 WireGuard 握手完成（隧道 ready）业务才可用
+	if !w.waitTunnelReady(ctx) {
+		log.Warnln("[WG](%s) tunnel not ready within %v after TCP connect, treating as failure", w.option.Name, wgReadyTimeout)
+		_ = conn.Close()
+		if w.registerBusyFailure() {
+			w.invalidateTunnelForBusyFailure()
+		}
+		return nil, E.New("tunnel not ready: WireGuard handshake timeout")
+	}
+	w.recordBusySuccess()
 	return NewConn(conn, w), nil
 }
 
 func (w *WireGuard) ListenPacketContext(ctx context.Context, metadata *C.Metadata) (_ C.PacketConn, err error) {
 	var pc net.PacketConn
 	if err = w.init(ctx); err != nil {
+		if isTunnelFailure(err) && w.registerBusyFailure() {
+			w.invalidateTunnelForBusyFailure()
+		}
 		return nil, err
 	}
 	if err = w.ResolveUDP(ctx, metadata); err != nil {
+		// DNS 解析失败不计入隧道健康
 		return nil, err
 	}
 	pc, err = w.tunDevice.ListenPacket(ctx, M.SocksaddrFrom(metadata.DstIP, metadata.DstPort).Unwrap())
 	if err != nil {
+		if isTunnelFailure(err) && w.registerBusyFailure() {
+			w.invalidateTunnelForBusyFailure()
+		}
 		return nil, err
 	}
 	if pc == nil {
+		if w.registerBusyFailure() {
+			w.invalidateTunnelForBusyFailure()
+		}
 		return nil, E.New("packetConn is nil")
 	}
+	w.recordBusySuccess()
 	return NewPacketConn(pc, w), nil
 }
 
