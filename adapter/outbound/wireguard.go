@@ -78,9 +78,12 @@ const busyFailThreshold = 3
 // 超过窗口未失败则重置，避免瞬时抖动误触发。
 const busyFailWindow = 30 * time.Second
 
-// wgReadyTimeout 为业务等待隧道握手完成的超时。TCP 建连后 WireGuard
-// 需要完成握手数据面才可用；此超时内业务等待 ready，超时才算失败。
-const wgReadyTimeout = 8 * time.Second
+// tunnelFailureDialTimeout bounds the tunnel establishment portion of a
+// business dial. The normal mihomo TCP timeout is too long when the TCP
+// wrapper is connected but WireGuard never completes its handshake.
+const tunnelFailureDialTimeoutValue = 3 * time.Second
+
+func tunnelFailureDialTimeout() time.Duration { return tunnelFailureDialTimeoutValue }
 
 // isTunnelFailure 判断业务错误是否属于"隧道数据面失败"（应触发重建）。
 // DNS 解析失败/超时属于外部解析问题，不应误判为隧道不可用而反复重建。
@@ -117,10 +120,10 @@ func (w *WireGuard) waitTunnelReady(ctx context.Context) bool {
 		if waiter, ok := w.bind.(interface {
 			WaitConnReady(string, time.Duration) bool
 		}); ok {
-			return waiter.WaitConnReady(ep, wgReadyTimeout)
+			return waiter.WaitConnReady(ep, tunnelFailureDialTimeout())
 		}
 		// 等待 ready 或超时
-		deadline := time.NewTimer(wgReadyTimeout)
+		deadline := time.NewTimer(tunnelFailureDialTimeout())
 		defer deadline.Stop()
 		for {
 			if tcpBind.IsConnReady(ep) {
@@ -801,9 +804,13 @@ func (w *WireGuard) DialContext(ctx context.Context, metadata *C.Metadata) (_ C.
 		options := w.DialOptions()
 		options = append(options, dialer.WithResolver(r))
 		options = append(options, dialer.WithNetDialer(wgNetDialer{tunDevice: w.tunDevice}))
-		conn, err = dialer.NewDialer(options...).DialContext(ctx, "tcp", metadata.RemoteAddress())
+		dialCtx, cancel := w.tunnelDialContext(ctx)
+		conn, err = dialer.NewDialer(options...).DialContext(dialCtx, "tcp", metadata.RemoteAddress())
+		cancel()
 	} else {
-		conn, err = w.tunDevice.DialContext(ctx, "tcp", M.SocksaddrFrom(metadata.DstIP, metadata.DstPort).Unwrap())
+		dialCtx, cancel := w.tunnelDialContext(ctx)
+		conn, err = w.tunDevice.DialContext(dialCtx, "tcp", M.SocksaddrFrom(metadata.DstIP, metadata.DstPort).Unwrap())
+		cancel()
 	}
 	if err != nil {
 		// 业务 dial 失败：区分 DNS 失败与隧道数据面失败。
@@ -821,7 +828,7 @@ func (w *WireGuard) DialContext(ctx context.Context, metadata *C.Metadata) (_ C.
 	}
 	// TCP 建连成功，但需等待 WireGuard 握手完成（隧道 ready）业务才可用
 	if !w.waitTunnelReady(ctx) {
-		log.Warnln("[WG](%s) tunnel not ready within %v after TCP connect, treating as failure", w.option.Name, wgReadyTimeout)
+		log.Warnln("[WG](%s) tunnel not ready within %v after TCP connect, treating as failure", w.option.Name, tunnelFailureDialTimeout())
 		_ = conn.Close()
 		if w.registerBusyFailure() {
 			w.invalidateTunnelForBusyFailure()
@@ -830,6 +837,13 @@ func (w *WireGuard) DialContext(ctx context.Context, metadata *C.Metadata) (_ C.
 	}
 	w.recordBusySuccess()
 	return NewConn(conn, w), nil
+}
+
+func (w *WireGuard) tunnelDialContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	if !w.option.TCP {
+		return ctx, func() {}
+	}
+	return context.WithTimeout(ctx, tunnelFailureDialTimeout())
 }
 
 func (w *WireGuard) ListenPacketContext(ctx context.Context, metadata *C.Metadata) (_ C.PacketConn, err error) {

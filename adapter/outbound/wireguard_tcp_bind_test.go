@@ -113,6 +113,12 @@ func TestTCPConnStateReadySignal(t *testing.T) {
 	state.markReady()
 }
 
+func TestTunnelFailureDialTimeoutIsShort(t *testing.T) {
+	if got := tunnelFailureDialTimeout(); got != 3*time.Second {
+		t.Fatalf("got %v, want 3s", got)
+	}
+}
+
 type oneByteReader struct{ r io.Reader }
 
 func (r *oneByteReader) Read(p []byte) (int, error) {
