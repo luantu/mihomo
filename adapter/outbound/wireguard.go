@@ -114,6 +114,11 @@ func (w *WireGuard) waitTunnelReady(ctx context.Context) bool {
 	ep := w.connectAddr.String()
 	// 连接不存在（尚未建立）时直接放行，让 Send 触发建连
 	if !tcpBind.IsConnReady(ep) {
+		if waiter, ok := w.bind.(interface {
+			WaitConnReady(string, time.Duration) bool
+		}); ok {
+			return waiter.WaitConnReady(ep, wgReadyTimeout)
+		}
 		// 等待 ready 或超时
 		deadline := time.NewTimer(wgReadyTimeout)
 		defer deadline.Stop()
@@ -173,17 +178,17 @@ func (w *WireGuard) invalidateTunnelForBusyFailure() {
 type WireGuardOption struct {
 	BasicOption
 	WireGuardPeerOption
-	Name                string `proxy:"name"`
-	Ip                  string `proxy:"ip,omitempty"`
-	Ipv6                string `proxy:"ipv6,omitempty"`
-	PrivateKey          string `proxy:"private-key"`
-	Workers             int    `proxy:"workers,omitempty"`
-	MTU                 int    `proxy:"mtu,omitempty"`
-	UDP                 bool   `proxy:"udp,omitempty"`
+	Name       string `proxy:"name"`
+	Ip         string `proxy:"ip,omitempty"`
+	Ipv6       string `proxy:"ipv6,omitempty"`
+	PrivateKey string `proxy:"private-key"`
+	Workers    int    `proxy:"workers,omitempty"`
+	MTU        int    `proxy:"mtu,omitempty"`
+	UDP        bool   `proxy:"udp,omitempty"`
 	// TCP 使 wireguard 走 TCP transport（兼容 corplink-rs 的 TCP 封装），
 	// 用于公司内部仅开放 TCP 的节点。默认 false（标准 UDP）。
-	TCP                 bool   `proxy:"tcp,omitempty"`
-	PersistentKeepalive int    `proxy:"persistent-keepalive,omitempty"`
+	TCP                 bool `proxy:"tcp,omitempty"`
+	PersistentKeepalive int  `proxy:"persistent-keepalive,omitempty"`
 
 	// Corplink 认证（可选）：启用后启动时调用 corplink /vpn/conn API
 	// 获取当前会话分配的隧道 IP 与服务器公钥，自动覆盖 ip/public-key。

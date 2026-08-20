@@ -78,9 +78,38 @@ type tcpConnState struct {
 	createdAt atomic.Int64
 	// ready 标记 WireGuard 握手是否已完成（隧道数据面可用）。
 	// TCP connected 不等于隧道可用；握手完成后由握手成功回调置 true。
-	ready atomic.Bool
+	ready     atomic.Bool
+	readyCh   chan struct{}
+	readyOnce sync.Once
 	// connID 为连接唯一序号，用于日志跟踪与代次保护（清理时避免误删新连接）。
 	connID uint64
+}
+
+func newTCPConnState(conn *net.TCPConn, connID uint64) *tcpConnState {
+	state := &tcpConnState{conn: conn, readyCh: make(chan struct{}), connID: connID}
+	state.lastRecv.Store(time.Now().UnixNano())
+	state.createdAt.Store(time.Now().UnixNano())
+	return state
+}
+
+func (s *tcpConnState) markReady() {
+	if s.ready.CompareAndSwap(false, true) {
+		s.readyOnce.Do(func() { close(s.readyCh) })
+	}
+}
+
+func (s *tcpConnState) waitReady(timeout time.Duration) bool {
+	if s.ready.Load() {
+		return true
+	}
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case <-s.readyCh:
+		return s.ready.Load()
+	case <-timer.C:
+		return false
+	}
 }
 
 // tcpConnStartupGuard 为连接建立后的"启动保护期"：期间忽略握手失败回调，
@@ -152,9 +181,7 @@ func (t *tcpWireGuardBind) accept() {
 		configureTCPConn(tcpConn)
 		addrPort := tcpConn.RemoteAddr().(*net.TCPAddr).AddrPort()
 		endpoint := &wgconn.StdNetEndpoint{AddrPort: addrPort}
-		state := &tcpConnState{conn: tcpConn, lastRecv: atomic.Int64{}, connID: t.connSeq.Add(1)}
-		state.lastRecv.Store(time.Now().UnixNano())
-		state.createdAt.Store(time.Now().UnixNano())
+		state := newTCPConnState(tcpConn, t.connSeq.Add(1))
 		t.tcpConnMap.Store(endpoint.DstToString(), state)
 		t.handleConn(state, endpoint, t.closeChan)
 	}
@@ -215,6 +242,7 @@ func (t *tcpWireGuardBind) invalidateConn(endpoint wgconn.Endpoint, state *tcpCo
 		return
 	}
 	_ = state.conn.Close()
+	state.readyOnce.Do(func() { close(state.readyCh) })
 	log.Infoln("[WG-TCP] connection invalidated conn_id=%d %s reason=%s", state.connID, key, reason)
 }
 
@@ -269,12 +297,27 @@ func (t *tcpWireGuardBind) MarkConnReady(endpoint string) {
 	}
 	if v, ok := t.tcpConnMap.Load(endpoint); ok {
 		if state, ok := v.(*tcpConnState); ok && state != nil {
-			if state.ready.CompareAndSwap(false, true) {
+			if !state.ready.Load() {
+				state.markReady()
 				t.recordEndpointSuccess(endpoint)
 				log.Infoln("[WG-TCP] tunnel ready conn_id=%d %s (WireGuard handshake completed)", state.connID, endpoint)
 			}
 		}
 	}
+}
+
+// WaitConnReady waits on the connection generation's shared readiness signal.
+// It avoids one polling timer per business request during handshake stalls.
+func (t *tcpWireGuardBind) WaitConnReady(endpoint string, timeout time.Duration) bool {
+	v, ok := t.tcpConnMap.Load(endpoint)
+	if !ok {
+		return false
+	}
+	state, ok := v.(*tcpConnState)
+	if !ok || state == nil {
+		return false
+	}
+	return state.waitReady(timeout)
 }
 
 // IsConnReady 返回 endpoint 对应连接是否已完成握手（隧道可用）。
@@ -455,9 +498,7 @@ func (t *tcpWireGuardBind) dialSingleFlight(endpoint wgconn.Endpoint, key string
 			t.failCount[key]++
 		} else {
 			configureTCPConn(tcpConn)
-			state = &tcpConnState{conn: tcpConn, lastRecv: atomic.Int64{}, connID: t.connSeq.Add(1)}
-			state.lastRecv.Store(time.Now().UnixNano())
-			state.createdAt.Store(time.Now().UnixNano())
+			state = newTCPConnState(tcpConn, t.connSeq.Add(1))
 			t.handleConn(state, endpoint, t.closeChan)
 			t.tcpConnMap.Store(key, state)
 		}

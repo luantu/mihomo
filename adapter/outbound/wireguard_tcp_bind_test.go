@@ -103,6 +103,16 @@ func TestHandshakeFailureEntersDialBackoff(t *testing.T) {
 	}
 }
 
+func TestTCPConnStateReadySignal(t *testing.T) {
+	state := newTCPConnState(nil, 1)
+	go func() {
+		if !state.waitReady(time.Second) {
+			t.Errorf("ready wait returned false")
+		}
+	}()
+	state.markReady()
+}
+
 type oneByteReader struct{ r io.Reader }
 
 func (r *oneByteReader) Read(p []byte) (int, error) {
