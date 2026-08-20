@@ -90,6 +90,19 @@ func TestTCPWireGuardBindCloseIsIdempotentAndClosesListener(t *testing.T) {
 	}
 }
 
+func TestHandshakeFailureEntersDialBackoff(t *testing.T) {
+	bind := newTCPWireGuardBind(context.Background(), nil)
+	key := "220.250.13.174:34080"
+
+	bind.recordEndpointFailure(key)
+	bind.mu.Lock()
+	got := bind.backoffRemainingLocked(key)
+	bind.mu.Unlock()
+	if got <= 0 {
+		t.Fatalf("handshake failure did not enter dial backoff: %v", got)
+	}
+}
+
 type oneByteReader struct{ r io.Reader }
 
 func (r *oneByteReader) Read(p []byte) (int, error) {

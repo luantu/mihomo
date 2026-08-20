@@ -101,12 +101,12 @@ type tcpWireGuardBind struct {
 	// mu guards the single-flight dial + per-endpoint backoff state so that
 	// only one goroutine establishes a TCP connection at a time, and broken
 	// tunnels fail fast and back off instead of causing a dial storm.
-	mu         sync.Mutex
-	lastFail   map[string]time.Time
-	failCount  map[string]uint32
-	dialing    map[string]bool
-	dialDone   map[string]chan struct{}
-	connSeq    atomic.Uint64 // 连接代次分配器
+	mu        sync.Mutex
+	lastFail  map[string]time.Time
+	failCount map[string]uint32
+	dialing   map[string]bool
+	dialDone  map[string]chan struct{}
+	connSeq   atomic.Uint64 // 连接代次分配器
 }
 
 var _ wgconn.Bind = (*tcpWireGuardBind)(nil)
@@ -218,6 +218,24 @@ func (t *tcpWireGuardBind) invalidateConn(endpoint wgconn.Endpoint, state *tcpCo
 	log.Infoln("[WG-TCP] connection invalidated conn_id=%d %s reason=%s", state.connID, key, reason)
 }
 
+// recordEndpointFailure records failures after TCP establishment as well as
+// failures during TCP dialing. A TCP socket is not a usable WireGuard tunnel
+// until the handshake completes, so handshake failures must participate in
+// the same backoff policy.
+func (t *tcpWireGuardBind) recordEndpointFailure(key string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.lastFail[key] = time.Now()
+	t.failCount[key]++
+}
+
+func (t *tcpWireGuardBind) recordEndpointSuccess(key string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	delete(t.lastFail, key)
+	delete(t.failCount, key)
+}
+
 // InvalidateEndpoint 按 endpoint 字符串（"ip:port"）失效对应 TCP 连接。
 // 供 wireguard device 层的握手失败回调使用：握手永久失败说明数据面已不可用，
 // 主动清理底层 TCP 连接，让下一次 Send 触发重建。
@@ -239,6 +257,7 @@ func (t *tcpWireGuardBind) InvalidateEndpoint(endpoint string) {
 		log.Debugln("[WG-TCP] skip invalidating %s: connection too young (age=%v)", endpoint, time.Since(created))
 		return
 	}
+	t.recordEndpointFailure(endpoint)
 	t.invalidateConn(stateEndpoint{key: endpoint}, state, "handshake failed")
 }
 
@@ -251,6 +270,7 @@ func (t *tcpWireGuardBind) MarkConnReady(endpoint string) {
 	if v, ok := t.tcpConnMap.Load(endpoint); ok {
 		if state, ok := v.(*tcpConnState); ok && state != nil {
 			if state.ready.CompareAndSwap(false, true) {
+				t.recordEndpointSuccess(endpoint)
 				log.Infoln("[WG-TCP] tunnel ready conn_id=%d %s (WireGuard handshake completed)", state.connID, endpoint)
 			}
 		}
@@ -440,8 +460,6 @@ func (t *tcpWireGuardBind) dialSingleFlight(endpoint wgconn.Endpoint, key string
 			state.createdAt.Store(time.Now().UnixNano())
 			t.handleConn(state, endpoint, t.closeChan)
 			t.tcpConnMap.Store(key, state)
-			delete(t.lastFail, key)
-			delete(t.failCount, key)
 		}
 	}
 	t.mu.Unlock()
