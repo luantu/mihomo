@@ -5,14 +5,44 @@ Windows 正式实例 `SG-Node`。Linux 对外节点名称为 `SG-Node-Linux`。
 
 ## 代码分支
 
+代码仓库为 `https://github.com/luantu/mihomo.git`。
+
 使用 GitHub 分支 `feat/corplink-sg-wg-tcp`。当前关键提交包括：
 
 - `c742ab45`：支持独立的 CorpLink device ID/device name；
 - `bab38092`：目标超时不拆除健康隧道；
 - `2749c582`：WireGuard TCP 数据面处理；
-- `2e61b42e`：保留 CorpLink 协商的 MTU 1400。
+- `2e61b42e`：保留 CorpLink 协商的 MTU 1400；
+- `0698410c`：本部署文档。
 
 部署前应确认远端 Git 分支包含这些提交；不要只拿旧的默认分支构建。
+
+全新机器获取代码：
+
+```bash
+git clone --branch feat/corplink-sg-wg-tcp https://github.com/luantu/mihomo.git /opt/mihomo-sg
+cd /opt/mihomo-sg
+git log -1 --oneline
+```
+
+`git log` 至少应能看到 `2e61b42e` 和 `0698410c`。
+
+## 全新 Linux 前置条件
+
+以下命令以 Debian/Ubuntu amd64 为例：
+
+```bash
+apt-get update
+DEBIAN_FRONTEND=noninteractive apt-get install -y ca-certificates curl git build-essential pkg-config jq openssl
+```
+
+本项目 `go.mod` 要求 Go 1.20 或更高版本。安装后确认：
+
+```bash
+go version
+```
+
+如果服务器不能访问 Go module proxy，应预先准备 Go module cache 或配置内部 `GOPROXY`，不要在依赖未完成时替换生产二进制。
 
 ## 工作方式
 
@@ -33,6 +63,47 @@ GOOS=linux GOARCH=amd64 go build -tags with_gvisor \
 
 `with_gvisor` 是必须的；缺少它会在启动时出现：
 `gVisor is not included in this build`。
+
+构建后检查产物：
+
+```bash
+file /root/mihomo-device-test-20260822/mihomo-linux-amd64-device-test
+sha256sum /root/mihomo-device-test-20260822/mihomo-linux-amd64-device-test
+```
+
+必须显示 `ELF 64-bit ... x86-64`，不能是 `PE32` 或 Windows 文件。
+
+## 生成全新 CorpLink 授权
+
+授权生成器 `corplink-rs` 不应复用 Windows 的配置目录。准备独立目录，例如：
+
+```text
+/opt/corplink-sg/config.json
+/opt/corplink-sg/wgdevtest22_cookies.json
+```
+
+`config.json` 的关键初始字段应类似：
+
+```json
+{
+  "username": "现场填写",
+  "password": "现场填写",
+  "device_id": null,
+  "public_key": null,
+  "private_key": null,
+  "device_name": "SG-Node-Linux-<hostname>",
+  "interface_name": "wgdevtest22"
+}
+```
+
+`device_id`、`public_key`、`private_key` 必须使用 `null`，让生成器创建新值；Linux
+接口名不超过 15 个字符。首次运行按所使用的 `corplink-rs` 发行版的 `--help` 和
+2FA 流程完成登录，确认生成独立 Cookie、公私钥、设备 ID。不要把密码、2FA、Cookie
+或密钥写进 GitHub。
+
+不同 `corplink-rs` 发行版的登录参数可能不同，部署 AI 不得凭空猜命令；必须以发行版
+自带帮助和日志为准。成功标准是登录成功、`/vpn/conn` 返回 WG 信息，并且授权文件
+属于本 Linux 实例。
 
 ## 配置要点
 
