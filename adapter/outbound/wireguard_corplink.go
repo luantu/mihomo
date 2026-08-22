@@ -37,6 +37,10 @@ type CorplinkOption struct {
 	Code string `proxy:"corplink-code,omitempty"`
 	// CookieFile 为 corplink 保存的 cookie 文件路径（utun16_cookies.json）。
 	CookieFile string `proxy:"corplink-cookie-file,omitempty"`
+	// DeviceID and DeviceName identify this client separately from other
+	// devices using the same account.
+	DeviceID   string `proxy:"corplink-device-id,omitempty"`
+	DeviceName string `proxy:"corplink-device-name,omitempty"`
 	// PublicKey 为本机 wireguard 公钥（base64），用于 /vpn/conn 请求。
 	PublicKey string `proxy:"corplink-public-key,omitempty"`
 	// RefreshCommand 为刷新 cookie 的可执行命令。
@@ -55,9 +59,9 @@ type CorplinkOption struct {
 }
 
 type corplinkRespWgInfo struct {
-	Code      int    `json:"code"`
-	Message   string `json:"message"`
-	Data      *struct {
+	Code    int    `json:"code"`
+	Message string `json:"message"`
+	Data    *struct {
 		IP        string `json:"ip"`
 		IPv6      string `json:"ipv6"`
 		IPMask    string `json:"ip_mask"`
@@ -70,10 +74,10 @@ type corplinkRespWgInfo struct {
 }
 
 type corplinkWgInfo struct {
-	IP            string
-	ServerPubKey  string
+	IP              string
+	ServerPubKey    string
 	ServerPubKeyHex string
-	MTU           int
+	MTU             int
 }
 
 // fetchCorplinkWgInfo 调用 corplink /vpn/conn API 获取当前会话的 wg 信息。
@@ -114,6 +118,17 @@ func fetchCorplinkWgInfo(opt CorplinkOption) (*corplinkWgInfo, error) {
 	}
 	if csrf != "" {
 		req.Header.Set("csrf-token", csrf)
+	}
+	if opt.DeviceID != "" {
+		cookie := req.Header.Get("Cookie")
+		if cookie != "" {
+			cookie += "; "
+		}
+		cookie += "device_id=" + opt.DeviceID
+		if opt.DeviceName != "" {
+			cookie += "; device_name=" + opt.DeviceName
+		}
+		req.Header.Set("Cookie", cookie)
 	}
 
 	client := &http.Client{Timeout: 15 * time.Second}
