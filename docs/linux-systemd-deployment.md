@@ -5,7 +5,8 @@ Windows 正式实例 `SG-Node`。Linux 对外节点名称为 `SG-Node-Linux`。
 
 ## 代码分支
 
-代码仓库为 `https://github.com/luantu/mihomo.git`。
+代码仓库为 `https://github.com/luantu/mihomo.git`；CorpLink 授权生成器仓库为
+`https://github.com/luantu/corplink-rs.git`。
 
 使用 GitHub 分支 `feat/corplink-sg-wg-tcp`。当前关键提交包括：
 
@@ -27,6 +28,14 @@ git log -1 --oneline
 
 `git log` 至少应能看到 `2e61b42e` 和 `0698410c`。
 
+授权生成器使用 `master` 分支：
+
+```bash
+git clone --depth 1 --branch master https://github.com/luantu/corplink-rs.git /opt/corplink-rs
+cd /opt/corplink-rs
+git log -1 --oneline
+```
+
 ## 全新 Linux 前置条件
 
 以下命令以 Debian/Ubuntu amd64 为例：
@@ -35,6 +44,19 @@ git log -1 --oneline
 apt-get update
 DEBIAN_FRONTEND=noninteractive apt-get install -y ca-certificates curl git build-essential pkg-config jq openssl
 ```
+
+构建 `corplink-rs` 还需要 Rust/Cargo。安装 Rust 后执行：
+
+```bash
+cd /opt/corplink-rs/libwg
+./build.sh
+cd /opt/corplink-rs
+cargo build --release
+install -m 755 target/release/corplink-rs /usr/local/bin/corplink-rs
+```
+
+本方案最终由 `mihomo-intl-node.service` 对外提供代理；`corplink-rs` 只用于生成或
+刷新授权信息，不要让两个服务争用同一个接口名或 Cookie。
 
 本项目 `go.mod` 要求 Go 1.20 或更高版本。安装后确认：
 
@@ -97,13 +119,17 @@ sha256sum /root/mihomo-device-test-20260822/mihomo-linux-amd64-device-test
 ```
 
 `device_id`、`public_key`、`private_key` 必须使用 `null`，让生成器创建新值；Linux
-接口名不超过 15 个字符。首次运行按所使用的 `corplink-rs` 发行版的 `--help` 和
-2FA 流程完成登录，确认生成独立 Cookie、公私钥、设备 ID。不要把密码、2FA、Cookie
-或密钥写进 GitHub。
+接口名不超过 15 个字符。首次运行命令格式为：
 
-不同 `corplink-rs` 发行版的登录参数可能不同，部署 AI 不得凭空猜命令；必须以发行版
-自带帮助和日志为准。成功标准是登录成功、`/vpn/conn` 返回 WG 信息，并且授权文件
-属于本 Linux 实例。
+```bash
+sudo /usr/local/bin/corplink-rs /opt/corplink-sg/config.json
+```
+
+按 2FA 流程完成登录，确认生成独立 Cookie、公私钥、设备 ID。不要把密码、2FA、
+Cookie 或密钥写进 GitHub。
+
+如发行版命令与此不同，以仓库 README 和 `corplink-rs --help` 为准。成功标准是登录
+成功、`/vpn/conn` 返回 WG 信息，并且授权文件属于本 Linux 实例。
 
 ## 配置要点
 
