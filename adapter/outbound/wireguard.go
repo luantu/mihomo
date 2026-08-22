@@ -684,14 +684,9 @@ func refreshCorplinkOption(option *WireGuardOption) error {
 		option.PublicKey = info.ServerPubKeyHex
 	}
 	if info.MTU != 0 {
-		// TCP-WireGuard adds framing overhead outside the WireGuard packet.
-		// Corplink reports the inner MTU (currently 1400), but that value can
-		// black-hole the first larger data packets on the TCP path. Keep a
-		// conservative ceiling until path-MTU discovery is available.
+		// Use the MTU negotiated by CorpLink. corplink-rs applies this value
+		// directly; keeping the same value is required for payload parity.
 		option.MTU = info.MTU
-		if option.TCP && option.MTU > 1280 {
-			option.MTU = 1280
-		}
 	}
 	log.Infoln("[WG](%s) corplink refreshed: ip=%s public_key=%s mtu=%d", option.Name, option.Ip, option.PublicKey, option.MTU)
 	return nil
